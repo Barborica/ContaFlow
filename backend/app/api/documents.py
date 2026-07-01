@@ -11,28 +11,35 @@ from fastapi import (
     HTTPException,
     UploadFile,
 )
+from fastapi.responses import Response
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.core.database import SessionLocal, get_db
 from app.models.document import Document
-from app.models.vendor import Vendor  # Avem nevoie și de modelul de furnizor
+from app.models.vendor import Vendor
 from app.services.anaf_service import get_company_details
 from app.services.ocr_service import extract_text_from_image
 from app.services.parser_service import parse_document_text
+from app.services.saga_service import generate_saga_xml
 
 router = APIRouter()
 
 os.makedirs("uploads", exist_ok=True)
 
 
+class DocumentUpdate(BaseModel):
+    total: float
+    status: str
+    vendor_id: int | None = None
+
+
 def process_document_background(document_id: int, file_path: str):
     db = SessionLocal()
     try:
-        # 1. OCR
+        # 1.Extragem textul din img
         extracted_text = extract_text_from_image(file_path)
-
-        # 2. Regex Parser
+        # 2. Parsăm textul pentru date relevante
         parsed_data = parse_document_text(extracted_text)
 
         doc = db.query(Document).filter(Document.id == document_id).first()
@@ -41,7 +48,6 @@ def process_document_background(document_id: int, file_path: str):
 
         doc.raw_text = extracted_text  # type: ignore
 
-        # Salvăm sumele și data găsite
         if parsed_data.get("total"):
             doc.total = float(parsed_data["total"])  # type: ignore
 
@@ -51,10 +57,7 @@ def process_document_background(document_id: int, file_path: str):
             company_data = get_company_details(cui_found)  # type: ignore
 
             if company_data:
-                # Căutăm dacă furnizorul există deja în baza de date
                 vendor = db.query(Vendor).filter(Vendor.cui == cui_found).first()
-
-                # Dacă nu există, îl creăm
                 if not vendor:
                     vendor = Vendor(
                         cui=cui_found,
@@ -106,12 +109,6 @@ def upload_document(
     }
 
 
-class DocumentUpdate(BaseModel):
-    total: float
-    status: str
-    vendor_id: int | None = None
-
-
 @router.get("/")
 def get_documents(db: Session = Depends(get_db)):
     """Returnează lista tuturor documentelor pentru interfața de revizuire."""
@@ -134,3 +131,25 @@ def update_document(
 
     db.commit()
     return {"message": "Document actualizat cu succes"}
+
+
+@router.post("/export/saga")
+def export_to_saga(db: Session = Depends(get_db)):
+    """
+    Colectează toate documentele APPROVED, generează fișierul XML
+    pentru SAGA și le schimbă statusul în EXPORTED.
+    """
+    approved_docs = db.query(Document).filter(Document.status == "APPROVED").all()
+    if not approved_docs:
+        raise HTTPException(
+            status_code=400, detail="Nu există documente aprobate pentru export."
+        )
+
+    xml_content = generate_saga_xml(approved_docs)
+
+    for doc in approved_docs:
+        doc.status = "EXPORTED"  # type: ignore
+    db.commit()
+
+    headers = {"Content-Disposition": "attachment; filename=import_saga_contaflow.xml"}
+    return Response(content=xml_content, media_type="application/xml", headers=headers)
