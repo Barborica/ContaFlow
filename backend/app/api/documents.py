@@ -7,7 +7,10 @@ from sqlalchemy.orm import Session
 
 from app.core.database import SessionLocal, get_db
 from app.models.document import Document
+from app.models.vendor import Vendor  # Avem nevoie și de modelul de furnizor
+from app.services.anaf_service import get_company_details
 from app.services.ocr_service import extract_text_from_image
+from app.services.parser_service import parse_document_text
 
 router = APIRouter()
 
@@ -17,14 +20,48 @@ os.makedirs("uploads", exist_ok=True)
 def process_document_background(document_id: int, file_path: str):
     db = SessionLocal()
     try:
+        # 1. OCR
         extracted_text = extract_text_from_image(file_path)
 
+        # 2. Regex Parser
+        parsed_data = parse_document_text(extracted_text)
+
         doc = db.query(Document).filter(Document.id == document_id).first()
-        if doc:
-            # --- MODIFICAT: Îi spunem lui Pylance să ignore avertismentul static ---
-            doc.raw_text = extracted_text  # type: ignore
-            doc.status = "NEEDS_REVIEW"  # type: ignore
-            db.commit()
+        if not doc:
+            return
+
+        doc.raw_text = extracted_text  # type: ignore
+
+        # Salvăm sumele și data găsite
+        if parsed_data.get("total"):
+            doc.total = float(parsed_data["total"])  # type: ignore
+
+        # 3. Interogare API Firme (dacă am găsit CUI)
+        if parsed_data.get("cui"):
+            cui_found = parsed_data["cui"]
+            company_data = get_company_details(cui_found)  # type: ignore
+
+            if company_data:
+                # Căutăm dacă furnizorul există deja în baza de date
+                vendor = db.query(Vendor).filter(Vendor.cui == cui_found).first()
+
+                # Dacă nu există, îl creăm
+                if not vendor:
+                    vendor = Vendor(
+                        cui=cui_found,
+                        name=company_data.get("name"),
+                        address=company_data.get("address"),
+                    )
+                    db.add(vendor)
+                    db.commit()
+                    db.refresh(vendor)
+
+                # Asociem documentul cu furnizorul găsit/creat
+                doc.vendor_id = vendor.id  # type: ignore
+
+        doc.status = "NEEDS_REVIEW"  # type: ignore
+        db.commit()
+
     except Exception as e:
         print(f"Eroare în background task: {e}")
     finally:
