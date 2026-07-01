@@ -2,7 +2,16 @@ import os
 import shutil
 from uuid import uuid4
 
-from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, UploadFile
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    UploadFile,
+)
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.core.database import SessionLocal, get_db
@@ -75,7 +84,6 @@ def upload_document(
     doc_type: str = Form(...),
     db: Session = Depends(get_db),
 ):
-    # --- MODIFICAT: Tratam cazul în care filename vine gol (None) ---
     safe_filename = file.filename or "document.jpg"
     file_extension = safe_filename.split(".")[-1]
 
@@ -90,10 +98,39 @@ def upload_document(
     db.commit()
     db.refresh(new_doc)
 
-    # --- MODIFICAT: Îi spunem lui Pylance să ignore tipul lui new_doc.id ---
     background_tasks.add_task(process_document_background, new_doc.id, file_location)  # type: ignore
 
     return {
         "document_id": new_doc.id,  # type: ignore
         "message": "Document încărcat cu succes. Procesare OCR inițiată în fundal.",
     }
+
+
+class DocumentUpdate(BaseModel):
+    total: float
+    status: str
+    vendor_id: int | None = None
+
+
+@router.get("/")
+def get_documents(db: Session = Depends(get_db)):
+    """Returnează lista tuturor documentelor pentru interfața de revizuire."""
+    return db.query(Document).all()
+
+
+@router.put("/{document_id}")
+def update_document(
+    document_id: int, update_data: DocumentUpdate, db: Session = Depends(get_db)
+):
+    """Permite aprobarea sau corectarea datelor OCR."""
+    doc = db.query(Document).filter(Document.id == document_id).first()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document negăsit")
+
+    doc.total = update_data.total  # type: ignore
+    doc.status = update_data.status  # type: ignore
+    if update_data.vendor_id:
+        doc.vendor_id = update_data.vendor_id  # type: ignore
+
+    db.commit()
+    return {"message": "Document actualizat cu succes"}
